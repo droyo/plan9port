@@ -65,13 +65,6 @@ struct WaylandClient {
 	int repeat_interval_ms;
 	int repeat_delay_ms;
 
-	// State for "key repeat" for the mouse scroll wheel.
-	// This allows touchpad devices to have accelerated scrolling.
-	int repeat_scroll_button;
-	int repeat_scroll_count;
-	int repeat_scroll_rate_ms;
-	int repeat_scroll_next_ms;
-
 	// The Wayland surface for this window
 	// and its corresponding xdg objects.
 	struct wl_surface *wl_surface;
@@ -85,7 +78,6 @@ struct WaylandClient {
 	// or scrolling is active, to implement key repeat and
 	// inertial scrolling.
 	struct wl_callback *wl_key_repeat_callback;
-	struct wl_callback *wl_scroll_repeat_callback;
 
 	// The mouse pointer and the surface for the current cursor.
 	struct wl_pointer *wl_pointer;
@@ -137,9 +129,6 @@ int entered_gfx_loop = 0;
 int key_repeat_delay_ms = 500;
 // The number of ms between repeats of a repeating key.
 int key_repeat_ms = 100;
-// The maximum number of ms between repeats of a scroll.
-// This is scaled by the number of repeating scrolls pending.
-int scroll_repeat_ms = 100;
 
 // A pool of xrgb888 buffers used for drawing to the screen.
 // When drawing, we give ownership of the buffer's memory to the compositor.
@@ -327,8 +316,9 @@ void wl_data_source_send(void *data,
 	const char *mime_type, int32_t fd) {
 	DEBUG("wl_data_source_send(mime_type=%s)\n", mime_type);
 
-	if (strcmp(mime_type, "text/plain") != 0) {
-		DEBUG("unknown mime type\n");
+	if (strcmp(mime_type, "text/plain") != 0 &&
+		strcmp(mime_type, "UTF8_STRING") != 0) {
+		DEBUG("unknown mime type: %s\n", mime_type);
 		close(fd);
 		return;
 	}
@@ -486,44 +476,6 @@ static const struct wl_callback_listener wl_callback_key_repeat_listener = {
 	.done = wl_callback_key_repeat,
 };
 
-static const struct wl_callback_listener wl_callback_scroll_listener;
-
-static void wl_callback_scroll_repeat(void *data, struct wl_callback *wl_callback, uint32_t time) {
-	Client* c = data;
-	WaylandClient *wl = (WaylandClient*) c->view;
-
-	wl_callback_destroy(wl_callback);
-	qlock(&wayland_lock);
-
-	int x = wl->mouse_x;
-	int y = wl->mouse_y;
-	int repeat_scroll_button = 0;
-	if (wl->repeat_scroll_button && time >= wl->repeat_scroll_next_ms) {
-		repeat_scroll_button = wl->repeat_scroll_button | wl->buttons;
-		wl->repeat_scroll_count--;
-		if (wl->repeat_scroll_count == 0) {
-			wl->repeat_scroll_button = 0;
-		} else {
-			wl->repeat_scroll_next_ms = time + scroll_repeat_ms/wl->repeat_scroll_count;
-		}
-	}
-
-	if (wl->repeat_scroll_count > 0) {
-		wl_callback = wl_surface_frame(wl->wl_surface);
-		wl_callback_add_listener(wl_callback, &wl_callback_scroll_listener, c);
-		wl_surface_commit(wl->wl_surface);
-	}
-	qunlock(&wayland_lock);
-
-	if (repeat_scroll_button) {
-		gfx_mousetrack(c, x, y, repeat_scroll_button, (uint) time);
-	}
-}
-
-static const struct wl_callback_listener wl_callback_scroll_listener = {
-	.done = wl_callback_scroll_repeat,
-};
-
 void wl_pointer_enter(void *data,struct wl_pointer *wl_pointer, uint32_t serial,
 	struct wl_surface *surface, wl_fixed_t surface_x, wl_fixed_t surface_y) {
 	Client* c = data;
@@ -546,7 +498,6 @@ void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
 	qlock(&wayland_lock);
 
 	wl->buttons = 0;
-	wl->repeat_scroll_button = 0;
 
 	qunlock(&wayland_lock);
 }
@@ -557,8 +508,6 @@ void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	wl->repeat_scroll_button = 0;
-	wl->repeat_scroll_count = 0;
 	wl->mouse_x = wl_fixed_to_int(surface_x) * wl_output_scale_factor;
 	wl->mouse_y = wl_fixed_to_int(surface_y) * wl_output_scale_factor;
 	int x = wl->mouse_x;
@@ -576,15 +525,14 @@ void wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t seria
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	wl->repeat_scroll_button = 0;
-	wl->repeat_scroll_count = 0;
-
 	int mask = 0;
 	switch (button) {
 	case BTN_LEFT:
 		mask = 1<<0;
 		break;
 	case BTN_MIDDLE:
+	case BTN_SIDE:
+	case BTN_EXTRA:
 		mask = 1<<1;
 		break;
 	case BTN_RIGHT:
@@ -601,10 +549,12 @@ void wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t seria
 		qunlock(&wayland_lock);
 		return;
 	}
+	int abort_compose = 0;
 	if (button == BTN_LEFT) {
 		if (wl->ctl) {
 			mask = 1 << CTL_BUTTON;
 		} else if (wl->alt) {
+			abort_compose = 1;
 			mask = 1 << ALT_BUTTON;
 		}
 	}
@@ -625,6 +575,10 @@ void wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t seria
 	int b = wl->buttons;
 
 	qunlock(&wayland_lock);
+	if (abort_compose) {
+		DEBUG("wl_pointer_button: gfx_abortcompose()\n");
+		gfx_abortcompose(c);
+	}
 	DEBUG("wl_pointer_button: gfx_trackmouse(x=%d, y=%d, b=%d)\n", x, y, b);
 	gfx_mousetrack(c, x, y, b, (uint) time);
 }
@@ -638,23 +592,12 @@ void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 
 	int x = wl->mouse_x;
 	int y = wl->mouse_y;
-	wl->repeat_scroll_button = 0;
-	wl->repeat_scroll_count = 0;
 
 	int b = 0;
 	if (value < 0) {
 		b |= 1 << 3;
 	} else if (value > 0) {
 		b |= 1 << 4;
-	}
-	int mag = fabs(value);
-	if (mag > 1) {
-		wl->repeat_scroll_button = b;
-		wl->repeat_scroll_count = mag;
-		wl->repeat_scroll_next_ms = time + scroll_repeat_ms/wl->repeat_scroll_count;
-		wl->wl_scroll_repeat_callback = wl_surface_frame(wl->wl_surface);
-		wl_callback_add_listener(wl->wl_scroll_repeat_callback,
-				&wl_callback_scroll_listener, c);
 	}
 	b |= wl->buttons;
 
@@ -721,6 +664,7 @@ void wl_keyboard_leave(void *data, struct wl_keyboard *wl_keyboard,
 	wl->repeat_rune = 0;
 
 	qunlock(&wayland_lock);
+	gfx_abortcompose(c);
 }
 
 void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
@@ -730,8 +674,6 @@ void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
 	qlock(&wayland_lock);
 
 	wl->repeat_rune = 0;
-	wl->repeat_scroll_button = 0;
-	wl->repeat_scroll_count = 0;
 
 	key += 8;	// Add 8 to translate Linux scan code to xkb code.
 	uint32_t rune = xkb_state_key_get_utf32(wl->xkb_state, key);
@@ -740,7 +682,7 @@ void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
 	if (wayland_debug) {
 		char name[256];
 		xkb_keysym_get_name(keysym, &name[0], 256);
-		char *state_str = WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up";
+		char *state_str = state == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up";
 		DEBUG("wl_keyboard_key: keysym=%s, rune=0x%x, state=%s\n",
 			name, rune, state_str);
 	}
@@ -840,8 +782,9 @@ void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
 				&wl_callback_key_repeat_listener, c);
 	}
 	qunlock(&wayland_lock);
-	if (state == WL_KEYBOARD_KEY_STATE_PRESSED && rune != 0)
+	if (state == WL_KEYBOARD_KEY_STATE_PRESSED && rune != 0) {
 		gfx_keystroke(c, rune);
+	}
 }
 
 void wl_keyboard_modifiers(void *data, struct wl_keyboard *wl_keyboard,
@@ -1098,20 +1041,20 @@ WaylandBuffer *new_buffer(int w, int h, int format) {
 void wayland_set_cursor(WaylandClient *wl, Cursor *cursor) {
 	// Convert bitmap to ARGB.
 	// Yes, this is super clunky. Sorry about that.
+	const uint32_t a = 0x00000000;
 	const uint32_t fg = 0xFF000000;
-	const uint32_t a = 0x00FFFFFF;
 	uint32_t data[8*32];
 	int j = 0;
 	for (int i = 0; i < 32; i++) {
 		char c = cursor->set[i];
-		data[j++] = (c >>7) & 1 == 1 ? fg : a;
-		data[j++] = (c >> 6) & 1 == 1 ? fg : a;
-		data[j++] = (c >> 5) & 1 == 1 ? fg : a;
-		data[j++] = (c >> 4) & 1 == 1 ? fg : a;
-		data[j++] = (c >> 3) & 1 == 1 ? fg : a;
-		data[j++] = (c >> 2) & 1 == 1 ? fg : a;
-		data[j++] = (c >> 1) & 1 == 1 ? fg : a;
-		data[j++] = (c >> 0) & 1 == 1 ? fg : a;
+		data[j++] = (c >>7) & 1 ? fg : a;
+		data[j++] = (c >> 6) & 1 ? fg : a;
+		data[j++] = (c >> 5) & 1 ? fg : a;
+		data[j++] = (c >> 4) & 1 ? fg : a;
+		data[j++] = (c >> 3) & 1 ? fg : a;
+		data[j++] = (c >> 2) & 1 ? fg : a;
+		data[j++] = (c >> 1) & 1 ? fg : a;
+		data[j++] = (c >> 0) & 1 ? fg : a;
 	}
 
 	WaylandBuffer *b = new_buffer(16, 16, WL_SHM_FORMAT_ARGB8888);
@@ -1337,6 +1280,7 @@ void	rpc_putsnarf(char *snarf_in) {
 		wl_data_device_manager_create_data_source(wl_data_device_manager);
 	wl_data_source_add_listener(source, &wl_data_source_listener, NULL);
 	wl_data_source_offer(source, "text/plain");
+	wl_data_source_offer(source, "UTF8_STRING");
 	wl_data_device_set_selection(wl_data_device, source, keyboard_enter_serial);
 
 	qunlock(&wayland_lock);
